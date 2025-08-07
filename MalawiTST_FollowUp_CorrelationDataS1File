@@ -1,0 +1,130 @@
+###########
+# Corr ####
+###########
+
+#setwd("")
+
+# Load required packages
+packages <- c("readxl", "dplyr", "stringr", "vcd")
+installed <- packages %in% rownames(installed.packages())
+if (any(!installed)) install.packages(packages[!installed])
+library(readxl)
+library(dplyr)
+library(stringr)
+library(vcd)
+
+# Load dataset
+df <- read_excel("Data_Clean_Tidy_NoSometimes.xlsx")
+
+# Convert logical and factor appropriately
+df <- df %>%
+  mutate(across(where(is.character), as.factor))
+
+# Split out variable types
+numeric_vars <- df %>% select(where(is.numeric))
+logical_vars <- df %>% select(where(is.logical))
+factor_vars  <- df %>% select(where(is.factor))
+
+# Combine logical + factor and filter down to ≤10 unique values
+cat_vars <- bind_cols(logical_vars, factor_vars)
+cat_vars <- cat_vars %>% select(where(~ length(unique(.)) <= 10))
+cat_names <- names(cat_vars)
+
+# Function: Utility function to compute Cramér's V and p
+cramers_v_stats <- function(x, y) {
+  tbl <- table(x, y)
+  cramer <- suppressWarnings(assocstats(tbl)$cramer)
+  fisher <- tryCatch(fisher.test(tbl), error = function(e) NULL)
+  p_val <- if (!is.null(fisher)) fisher$p.value else NA
+  n_obs <- sum(tbl)
+  list(correlation = cramer, p = p_val, n = n_obs)
+}
+
+# Function: point-biserial with cor.test
+pbiserial_stats <- function(x, y) {
+  df <- data.frame(x = as.numeric(x), y = y)
+  df <- df[complete.cases(df), ]
+  if (nrow(df) < 3) return(list(correlation = NA, p = NA, n = nrow(df)))
+  test <- tryCatch(cor.test(df$x, df$y), error = function(e) NULL)
+  if (!is.null(test)) {
+    list(correlation = test$estimate, p = test$p.value, n = nrow(df))
+  } else {
+    list(correlation = NA, p = NA, n = nrow(df))
+  }
+}
+
+# Function: Pearson correlation between numerics
+pearson_stats <- function(x, y) {
+  df <- data.frame(x, y)
+  df <- df[complete.cases(df), ]
+  if (nrow(df) < 3) return(list(correlation = NA, p = NA, n = nrow(df)))
+  test <- tryCatch(cor.test(df$x, df$y), error = function(e) NULL)
+  if (!is.null(test)) {
+    list(correlation = test$estimate, p = test$p.value, n = nrow(df))
+  } else {
+    list(correlation = NA, p = NA, n = nrow(df))
+  }
+}
+
+
+# Store results
+results <- list()
+
+# Loop through all pairs of valid categorical columns
+for (i in 1:(length(cat_names) - 1)) {
+  for (j in (i + 1):length(cat_names)) {
+    res <- try(cramers_v_stats(cat_vars[[i]], cat_vars[[j]]), silent = TRUE)
+    if (!inherits(res, "try-error") && !is.null(res)) {
+      results[[length(results) + 1]] <- data.frame(
+        Var1 = cat_names[i], Var2 = cat_names[j], Type = "Cramer's V",
+        Correlation = res$correlation, p_value = res$p, n_obs = res$n
+      )
+    }
+  }
+}
+
+# Logical vs Numeric (Point-biserial)
+for (log_var in names(logical_vars)) {
+  for (num_var in names(numeric_vars)) {
+    res <- pbiserial_stats(logical_vars[[log_var]], numeric_vars[[num_var]])
+    results[[length(results) + 1]] <- data.frame(
+      Var1 = log_var, Var2 = num_var, Type = "Point-biserial",
+      Correlation = res$correlation, p_value = res$p, n_obs = res$n
+    )
+  }
+}
+
+# Numeric vs Numeric (Pearson)
+num_names <- names(numeric_vars)
+for (i in 1:(length(num_names) - 1)) {
+  for (j in (i + 1):length(num_names)) {
+    res <- pearson_stats(numeric_vars[[i]], numeric_vars[[j]])
+    results[[length(results) + 1]] <- data.frame(
+      Var1 = num_names[i], Var2 = num_names[j], Type = "Pearson",
+      Correlation = res$correlation, p_value = res$p, n_obs = res$n
+    )
+  }
+}
+
+# Combine and sort
+results_df <- do.call(rbind, results) %>%
+  filter(!is.na(Correlation)) %>%
+  arrange(desc(abs(Correlation)))
+
+# Filter out correlations with low observation count
+results_df <- results_df %>%
+  filter(p_value < 0.05)
+
+# Cramer's V (categorical vs categorical)
+results_cramers <- results_df %>%
+  filter(Type == "Cramer's V")
+
+# Point-biserial (logical vs numeric)
+results_pbiserial <- results_df %>%
+  filter(Type == "Point-biserial")
+
+# Pearson (numeric vs numeric)
+results_pearson <- results_df %>%
+  filter(Type == "Pearson")
+
+write.csv(results_df,"CorrelationData.csv")
