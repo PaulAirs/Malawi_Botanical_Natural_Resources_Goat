@@ -1,0 +1,132 @@
+library(readxl)         
+library(dplyr)          
+library(janitor)        
+library(lme4)          
+library(lmerTest)       
+library(emmeans)        
+library(broom.mixed)   
+library(purrr)          
+library(glmmTMB)
+
+setwd("~/Library/CloudStorage/OneDrive-MurrayEdwardsCollege/BotanicalTST_followupSurvey")
+
+# Load the data (adjust path as needed)
+df <- read_excel("Data_Clean_Tidy_NoSometimes.xlsx")
+
+# Set factors (needed for group and village at a minimum)
+df_clean <- df %>%
+  mutate(across(where(is.character), as.factor)) %>% 
+  clean_names()
+colnames(df_clean) # See the new names
+
+# Select only columns that are logical (TRUE/FALSE)
+binary_vars <- df_clean %>%
+  select(where(is.logical)) %>%
+  colnames()
+
+fit_glmm <- function(var) {
+  formula <- as.formula(paste0(var, " ~ group + (1 | village)"))
+  
+  model <- tryCatch(
+    glmmTMB(formula, family = binomial(), data = df_clean),
+    error = function(e) {
+      message("Model failed for: ", var, " — ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(model)) {
+    if (any(is.na(summary(model)$vcov))) {
+      message("Skipping due to NA in vcov for: ", var)
+      return(NULL)
+    }
+    
+    coefs <- summary(model)$coefficients$cond
+    
+    # Grab all rows related to group
+    group_rows <- grep("^group", rownames(coefs), value = TRUE)
+    
+    if (length(group_rows) == 0) {
+      message("No group effect found for: ", var)
+      return(NULL)
+    }
+    
+    # Build a tibble of all group contrasts
+    result <- tibble(
+      variable = var,
+      term = group_rows,
+      estimate = coefs[group_rows, "Estimate"],
+      std_error = coefs[group_rows, "Std. Error"],
+      z_value = coefs[group_rows, "z value"],
+      p_value = coefs[group_rows, "Pr(>|z|)"]
+    )
+    
+    return(result)
+  } else {
+    return(NULL)
+  }
+}
+
+results <- map(binary_vars, fit_glmm) %>%
+  compact() %>%
+  bind_rows()
+
+# Adjust p-values for multiple testing
+results <- results %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+write.csv(results, 'glmmTMB_village_random_results.csv')
+
+
+
+run_posthoc_emmeans <- function(var) {
+  message("Processing variable: ", var)
+  
+  formula <- as.formula(paste0(var, " ~ group + (1 | village)"))
+  
+  model <- tryCatch(
+    glmmTMB(formula, family = binomial(), data = df_clean),
+    error = function(e) {
+      message("Model failed for: ", var, " — ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(model)) return(NULL)
+  
+  # Check for bad model fits
+  if (any(is.na(summary(model)$vcov))) {
+    message("Skipping due to NA in vcov for: ", var)
+    return(NULL)
+  }
+  
+  # Run pairwise post-hoc comparison (Tukey adjustment)
+  posthoc <- tryCatch(
+    emmeans(model, pairwise ~ group, type = "response", adjust = "tukey"),
+    error = function(e) {
+      message("Post-hoc failed for: ", var, " — ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(posthoc)) return(NULL)
+  
+  # Extract pairwise comparisons table
+  contrasts <- as.data.frame(posthoc$contrasts)
+  
+  # Add variable name
+  contrasts$variable <- var
+  
+  return(contrasts)
+}
+
+posthoc_results <- map(binary_vars, run_posthoc_emmeans) %>%
+  compact() %>%
+  bind_rows()
+
+write.csv(posthoc_results, 'glmmTMB_village_random_posthoc_results.csv')
+
+# Reorder columns
+posthoc_results_sig <- posthoc_results %>%
+  filter(p.value <0.05)
